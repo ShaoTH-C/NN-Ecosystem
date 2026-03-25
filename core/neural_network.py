@@ -1,8 +1,29 @@
 # neural_network.py - feed-forward neural net built from scratch with numpy
-# no autograd here, weights get evolved instead of trained via backprop
+# weights get evolved instead of trained via backprop
+# optional GPU acceleration via CuPy (CUDA)
 
 import numpy as np
 from typing import List, Callable
+
+# GPU support - try cupy for CUDA acceleration
+_GPU_AVAILABLE = False
+_cp = None
+try:
+    import cupy as _cp
+    _GPU_AVAILABLE = True
+except ImportError:
+    pass
+
+
+def gpu_available() -> bool:
+    return _GPU_AVAILABLE
+
+
+def get_xp(use_gpu: bool = False):
+    """Get the array module (cupy for GPU, numpy for CPU)."""
+    if use_gpu and _GPU_AVAILABLE:
+        return _cp
+    return np
 
 
 # activation functions
@@ -31,7 +52,7 @@ ACTIVATIONS = {
 class NeuralNetwork:
     """
     Simple fully-connected feed-forward net.
-    layer_sizes is something like [27, 20, 16, 4].
+    layer_sizes is something like [40, 48, 32, 5].
     Weights get set externally by the Genome class.
     """
 
@@ -65,6 +86,25 @@ class NeuralNetwork:
             else:
                 # last layer uses output activation (tanh for bounded outputs)
                 a = self.output_activation_fn(z)
+        return a
+
+    @staticmethod
+    def batched_forward(inputs, weight_stacks, bias_stacks, xp=np):
+        """Batched forward pass for N networks with the same architecture.
+
+        Args:
+            inputs: (N, input_size) array
+            weight_stacks: list of (N, fan_in, fan_out) arrays, one per layer
+            bias_stacks: list of (N, fan_out) arrays, one per layer
+            xp: array module (numpy or cupy)
+
+        Returns:
+            (N, output_size) array of outputs
+        """
+        a = inputs
+        for W, B in zip(weight_stacks, bias_stacks):
+            z = xp.einsum('ni,nio->no', a, W) + B
+            a = xp.tanh(z)
         return a
 
     def get_flat_weights(self) -> np.ndarray:

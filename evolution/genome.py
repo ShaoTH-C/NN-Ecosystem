@@ -9,9 +9,8 @@ import config as cfg
 
 class Genome:
     """
-    Stores the DNA of a creature's brain. The genes array is just all the
-    weights and biases flattened into one vector. Mutation tweaks those values,
-    and occasionally adds or removes a neuron from a hidden layer.
+    Stores the DNA of a creature's brain. The genes array is all the
+    weights and biases flattened into one vector. Mutation tweaks those values.
     """
 
     def __init__(
@@ -31,7 +30,7 @@ class Genome:
             self.genes = self._xavier_init()
 
     def _xavier_init(self) -> np.ndarray:
-        """Xavier init - gives reasonable starting weights so things aren't totally random."""
+        """Xavier init - gives reasonable starting weights."""
         parts = []
         for i in range(len(self.layer_sizes) - 1):
             fan_in = self.layer_sizes[i]
@@ -54,9 +53,8 @@ class Genome:
 
     def mutate(self) -> "Genome":
         """
-        Returns a mutated copy. Most of the time it just perturbs weights with
-        gaussian noise. Occasionally it'll reset a weight entirely, and very
-        rarely it'll add or remove a hidden neuron.
+        Returns a mutated copy with standard exploration-level noise.
+        Used for respawning and general evolution.
         """
         new_genes = self.genes.copy()
         new_layer_sizes = list(self.layer_sizes)
@@ -72,13 +70,34 @@ class Genome:
             new_genes[idx] = np.random.randn() * cfg.WEIGHT_INIT_STD
 
         # rarely, mess with the topology
-        if np.random.rand() < cfg.TOPOLOGY_MUTATION_RATE and len(new_layer_sizes) > 2:
-            new_layer_sizes, new_genes = self._topology_mutate(
-                new_layer_sizes, new_genes
-            )
+        if cfg.TOPOLOGY_MUTATION_RATE > 0 and np.random.rand() < cfg.TOPOLOGY_MUTATION_RATE:
+            if len(new_layer_sizes) > 2:
+                new_layer_sizes, new_genes = self._topology_mutate(
+                    new_layer_sizes, new_genes
+                )
 
         child = Genome(
             layer_sizes=new_layer_sizes,
+            genes=new_genes,
+            generation=self.generation + 1,
+        )
+        return child
+
+    def mutate_child(self) -> "Genome":
+        """
+        Low-mutation copy for parent -> child knowledge transfer.
+        Children inherit most of the parent's brain with minimal noise,
+        like a parent teaching a child its skills.
+        """
+        new_genes = self.genes.copy()
+
+        # very light perturbation (teaching, not randomizing)
+        mask = np.random.rand(len(new_genes)) < cfg.CHILD_MUTATION_RATE
+        perturbation = np.random.randn(len(new_genes)) * cfg.CHILD_MUTATION_STRENGTH
+        new_genes[mask] += perturbation[mask]
+
+        child = Genome(
+            layer_sizes=list(self.layer_sizes),
             genes=new_genes,
             generation=self.generation + 1,
         )
@@ -92,7 +111,7 @@ class Genome:
 
         layer_idx = np.random.choice(hidden_indices)
 
-        if np.random.rand() < 0.6 and layer_sizes[layer_idx] < 32:
+        if np.random.rand() < 0.6 and layer_sizes[layer_idx] < 64:
             # add a neuron
             new_sizes = list(layer_sizes)
             new_sizes[layer_idx] += 1
@@ -101,7 +120,7 @@ class Genome:
             min_len = min(len(genes), len(new_genes))
             new_genes[:min_len] = genes[:min_len]
             return new_sizes, new_genes
-        elif layer_sizes[layer_idx] > 4:
+        elif layer_sizes[layer_idx] > 8:
             # remove a neuron (don't let layers get too small)
             new_sizes = list(layer_sizes)
             new_sizes[layer_idx] -= 1
@@ -114,14 +133,16 @@ class Genome:
         return layer_sizes, genes
 
     def copy(self) -> "Genome":
-        return Genome(
+        g = Genome(
             layer_sizes=list(self.layer_sizes),
             genes=self.genes.copy(),
             generation=self.generation,
         )
+        g.fitness = self.fitness
+        return g
 
     def distance(self, other: "Genome") -> float:
-        """How genetically different two genomes are. Used for speciation."""
+        """How genetically different two genomes are."""
         if self.layer_sizes != other.layer_sizes:
             return float("inf")
         return float(np.sqrt(np.mean((self.genes - other.genes) ** 2)))

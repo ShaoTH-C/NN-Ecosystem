@@ -51,13 +51,33 @@ def run_visual(max_ticks: int = 0):
     print("  SPACE=pause  S=sensors  F=turbo  1-6=speed  Q=quit")
     print("=" * 55)
 
+    import pygame
+
     running = True
+    frame = 0
     try:
         while running:
-            running = renderer.render()
+            # at high speeds, batch sim steps and only render occasionally
+            # this keeps the UI responsive without redrawing every tick batch
+            if renderer.sim_speed <= 5:
+                steps_per_loop = renderer.sim_speed
+                render_interval = 1
+            else:
+                # do 5 steps per loop iteration, render every Nth iteration
+                steps_per_loop = 5
+                render_interval = max(1, renderer.sim_speed // steps_per_loop)
+
+            if frame % render_interval == 0:
+                running = renderer.render()
+            else:
+                running = renderer.process_events()
 
             if not renderer.paused:
-                for _ in range(renderer.sim_speed):
+                # only compute sensor viz data on the last step before a render
+                for i in range(steps_per_loop):
+                    is_last_step = (i == steps_per_loop - 1)
+                    next_frame_renders = ((frame + 1) % render_interval == 0)
+                    world.store_sensor_viz = is_last_step and next_frame_renders
                     world.step()
                     tracker.update()
 
@@ -65,10 +85,11 @@ def run_visual(max_ticks: int = 0):
                         running = False
                         break
 
-            import pygame
             keys = pygame.key.get_pressed()
             if keys[pygame.K_q]:
                 running = False
+
+            frame += 1
 
     except KeyboardInterrupt:
         print("\nInterrupted.")
@@ -80,7 +101,7 @@ def run_visual(max_ticks: int = 0):
     tracker.generate_plots()
 
 
-def run_headless(max_ticks: int = 10000):
+def run_headless(max_ticks: int = 100000):
     world = World()
     tracker = Tracker(world)
 

@@ -1,5 +1,6 @@
 # world.py - the main simulation loop
-# handles spawning, sensing, movement, eating, attacking, reproduction, cleanup
+# handles spawning, sensing, batched NN thinking, movement,
+# eating, attacking, mate-based reproduction, aging, and cleanup
 
 import numpy as np
 from typing import List, Dict, Tuple, Optional
@@ -7,15 +8,24 @@ from collections import defaultdict
 
 from core.creature import Creature, Species
 from core.food import Food
+from core.neural_network import NeuralNetwork, get_xp
 from evolution.genome import Genome
-from evolution.selection import select_parent, crossover
+from evolution.selection import crossover
 import config as cfg
+
+# GPU support
+try:
+    import cupy as cp
+    _CUPY_AVAILABLE = True
+except ImportError:
+    cp = None
+    _CUPY_AVAILABLE = False
 
 
 class World:
     """
-    The 2D ecosystem. Each tick it runs through the full lifecycle:
-    spawn food -> sense -> think -> move -> eat/attack -> reproduce -> cleanup
+    The 2D ecosystem. Each tick runs through:
+    spawn food -> sense -> think (batched) -> move -> eat/attack -> breed -> cleanup
     """
 
     def __init__(self):
@@ -35,9 +45,16 @@ class World:
         self.max_generation_herb = 0
         self.max_generation_carn = 0
 
-        # spatial grid so we don't have to check every creature against every other
+        # spatial grids for fast neighbor lookups
         self.grid_cell_size = cfg.SENSOR_RANGE
         self.grid: Dict[Tuple[int, int], List] = defaultdict(list)
+        self.food_grid: Dict[Tuple[int, int], List] = defaultdict(list)
+
+        # creature lookup by ID (for parent tracking)
+        self.creature_lookup: Dict[int, Creature] = {}
+
+        # set to False on non-render ticks to skip sensor visualization data
+        self.store_sensor_viz = True
 
         self._spawn_initial_population()
         self._spawn_initial_food()
@@ -71,24 +88,132 @@ class World:
 
         self._spawn_food()
         self._build_grid()
+        self._build_creature_lookup()
 
         food_pos, herb_pos, carn_pos = self._gather_positions()
 
+        # phase 1: sense (per-creature, vectorized rays + nearest-target)
         for creature in self.creatures:
             if not creature.alive:
                 continue
-            creature.cast_sensors(food_pos, herb_pos, carn_pos)
-            creature.think()
+            self._set_parent_direction(creature)
+            creature.cast_sensors(
+                food_pos, herb_pos, carn_pos,
+                store_viz=self.store_sensor_viz,
+            )
+
+        # phase 2: think (batched NN forward pass for performance)
+        self._batch_think()
+
+        # phase 3: act
+        for creature in self.creatures:
+            if not creature.alive:
+                continue
             creature.move()
             creature.consume_energy()
+            if not creature.alive:
+                continue
             creature.update()
 
+        # phase 4: interactions
         self._handle_eating()
         self._handle_attacks()
         self._handle_reproduction()
         self._remove_dead()
         self._enforce_population_limits()
         self._track_best_genomes()
+
+    # --- batched neural network forward pass ---
+
+    def _batch_think(self):
+        """Run all creatures' NNs in one batched operation per topology group.
+        Uses GPU (cupy) if available and enabled, otherwise numpy."""
+        living = [c for c in self.creatures if c.alive]
+        if not living:
+            return
+
+        use_gpu = getattr(cfg, 'USE_GPU', False) and _CUPY_AVAILABLE
+        xp = cp if use_gpu else np
+
+        # group creatures by network topology for batching
+        groups: Dict[tuple, List[Creature]] = defaultdict(list)
+        for c in living:
+            key = tuple(c.brain.layer_sizes)
+            groups[key].append(c)
+
+        for layer_sizes, creatures in groups.items():
+            N = len(creatures)
+            num_layers = len(layer_sizes) - 1
+            input_size = layer_sizes[0]
+
+            # build batched input matrix
+            inputs = np.zeros((N, input_size))
+            for i, c in enumerate(creatures):
+                inputs[i] = c.build_nn_inputs()
+
+            # stack weight matrices for each layer
+            layer_W = []
+            layer_B = []
+            for l in range(num_layers):
+                W = np.stack([c.brain.weights[l] for c in creatures])
+                B = np.stack([c.brain.biases[l] for c in creatures])
+                layer_W.append(W)
+                layer_B.append(B)
+
+            # transfer to GPU if available
+            if use_gpu:
+                inputs = xp.asarray(inputs)
+                layer_W = [xp.asarray(w) for w in layer_W]
+                layer_B = [xp.asarray(b) for b in layer_B]
+
+            # batched forward pass
+            outputs = NeuralNetwork.batched_forward(inputs, layer_W, layer_B, xp)
+
+            # transfer back to CPU
+            if use_gpu:
+                outputs = xp.asnumpy(outputs)
+
+            # distribute outputs to creatures
+            for i, c in enumerate(creatures):
+                c.apply_nn_outputs(outputs[i])
+
+    # --- parent tracking ---
+
+    def _build_creature_lookup(self):
+        self.creature_lookup.clear()
+        for c in self.creatures:
+            if c.alive:
+                self.creature_lookup[c.id] = c
+
+    def _set_parent_direction(self, creature: Creature):
+        """For immature creatures, compute direction toward parent."""
+        if creature.maturity >= 1.0 or creature.parent_id is None:
+            creature.parent_direction = (0.0, 0.0)
+            return
+
+        parent = self.creature_lookup.get(creature.parent_id)
+        if parent is None or not parent.alive:
+            creature.parent_direction = (0.0, 0.0)
+            creature.parent_id = None
+            return
+
+        # toroidal direction to parent
+        dx = parent.x - creature.x
+        dy = parent.y - creature.y
+        if abs(dx) > cfg.WORLD_WIDTH / 2:
+            dx -= np.sign(dx) * cfg.WORLD_WIDTH
+        if abs(dy) > cfg.WORLD_HEIGHT / 2:
+            dy -= np.sign(dy) * cfg.WORLD_HEIGHT
+
+        abs_angle = np.arctan2(dy, dx)
+        rel_angle = abs_angle - creature.angle
+
+        # strength fades as creature matures
+        strength = 1.0 - creature.maturity
+        creature.parent_direction = (
+            float(np.sin(rel_angle) * strength),
+            float(np.cos(rel_angle) * strength),
+        )
 
     # --- food spawning ---
 
@@ -104,10 +229,15 @@ class World:
 
     def _build_grid(self):
         self.grid.clear()
+        self.food_grid.clear()
         for creature in self.creatures:
             if creature.alive:
                 cell = self._get_cell(creature.x, creature.y)
                 self.grid[cell].append(creature)
+        for food in self.food_items:
+            if food.alive:
+                cell = self._get_cell(food.x, food.y)
+                self.food_grid[cell].append(food)
 
     def _get_cell(self, x: float, y: float) -> Tuple[int, int]:
         return (int(x // self.grid_cell_size), int(y // self.grid_cell_size))
@@ -124,38 +254,50 @@ class World:
 
     def _gather_positions(self):
         """Collect positions of food/herbs/carns into arrays for the sensor system."""
-        food_pos = np.array(
-            [[f.x, f.y] for f in self.food_items if f.alive]
-        ) if any(f.alive for f in self.food_items) else np.empty((0, 2))
+        food_list = []
+        herb_list = []
+        carn_list = []
 
-        herb_pos = np.array(
-            [[c.x, c.y] for c in self.creatures
-             if c.alive and c.species == Species.HERBIVORE]
-        ) if any(c.alive and c.species == Species.HERBIVORE for c in self.creatures) else np.empty((0, 2))
+        for f in self.food_items:
+            if f.alive:
+                food_list.append((f.x, f.y))
 
-        carn_pos = np.array(
-            [[c.x, c.y] for c in self.creatures
-             if c.alive and c.species == Species.CARNIVORE]
-        ) if any(c.alive and c.species == Species.CARNIVORE for c in self.creatures) else np.empty((0, 2))
+        for c in self.creatures:
+            if not c.alive:
+                continue
+            if c.species == Species.HERBIVORE:
+                herb_list.append((c.x, c.y))
+            else:
+                carn_list.append((c.x, c.y))
+
+        food_pos = np.array(food_list, dtype=np.float64) if food_list else np.empty((0, 2))
+        herb_pos = np.array(herb_list, dtype=np.float64) if herb_list else np.empty((0, 2))
+        carn_pos = np.array(carn_list, dtype=np.float64) if carn_list else np.empty((0, 2))
 
         return food_pos, herb_pos, carn_pos
 
     # --- eating (herbivores eat food) ---
 
+    def _get_nearby_food(self, creature: Creature) -> List[Food]:
+        cx, cy = self._get_cell(creature.x, creature.y)
+        nearby = []
+        for dx in range(-1, 2):
+            for dy in range(-1, 2):
+                nearby.extend(self.food_grid.get((cx + dx, cy + dy), []))
+        return nearby
+
     def _handle_eating(self):
         for creature in self.creatures:
-            if (
-                not creature.alive
-                or creature.species != Species.HERBIVORE
-                or not creature.wants_to_eat
-            ):
+            if not creature.alive or creature.species != Species.HERBIVORE:
                 continue
 
-            for food in self.food_items:
+            for food in self._get_nearby_food(creature):
                 if not food.alive:
                     continue
                 dist = creature.distance_to(food)
-                if dist < cfg.EAT_RANGE:
+
+                # instinct: auto-eat if very close, OR NN wants to eat and in range
+                if dist < cfg.INSTINCT_EAT_RANGE or (creature.wants_to_eat and dist < cfg.EAT_RANGE):
                     energy = food.consume()
                     creature.gain_energy(energy)
                     creature.food_eaten += 1
@@ -166,14 +308,8 @@ class World:
 
     def _handle_attacks(self):
         for creature in self.creatures:
-            if (
-                not creature.alive
-                or creature.species != Species.CARNIVORE
-                or not creature.wants_to_attack
-            ):
+            if not creature.alive or creature.species != Species.CARNIVORE:
                 continue
-
-            creature.energy -= cfg.ATTACK_ENERGY_COST
 
             # find nearest herbivore in range
             best_target = None
@@ -191,16 +327,34 @@ class World:
                     best_dist = dist
                     best_target = other
 
-            if best_target is not None:
-                best_target.energy -= cfg.ATTACK_DAMAGE
-                if best_target.energy <= 0:
-                    best_target.alive = False
-                    # successful kill = big energy reward
-                    creature.gain_energy(cfg.FOOD_ENERGY * 2.5)
-                    creature.kills += 1
-                    self.total_kills += 1
+            if best_target is None:
+                continue
 
-    # --- reproduction ---
+            # instinct: auto-attack when very close, OR NN wants to attack
+            do_attack = False
+            if best_dist < cfg.INSTINCT_ATTACK_RANGE:
+                do_attack = True  # reflex
+            elif creature.wants_to_attack and best_dist < cfg.ATTACK_RANGE:
+                do_attack = True
+
+            if not do_attack:
+                continue
+
+            creature.energy -= cfg.ATTACK_ENERGY_COST
+
+            # damage scales with speed (charging attack)
+            speed_factor = 0.5 + 0.5 * (creature.speed / creature.max_speed if creature.max_speed > 0 else 0)
+            damage = cfg.ATTACK_DAMAGE * speed_factor
+            best_target.energy -= damage
+
+            if best_target.energy <= 0:
+                best_target.alive = False
+                energy_gain = best_target.get_energy_value()
+                creature.gain_energy(energy_gain)
+                creature.kills += 1
+                self.total_kills += 1
+
+    # --- reproduction (mate-based) ---
 
     def _handle_reproduction(self):
         new_creatures = []
@@ -214,11 +368,20 @@ class World:
             if c.alive and c.species == Species.CARNIVORE
         )
 
-        for creature in self.creatures:
-            if not creature.can_reproduce():
+        # gather candidates and shuffle to avoid order bias
+        breeding_candidates = [c for c in self.creatures if c.can_breed()]
+        if breeding_candidates:
+            np.random.shuffle(breeding_candidates)
+
+        already_bred = set()
+
+        for creature in breeding_candidates:
+            if creature.id in already_bred:
+                continue
+            if not creature.can_breed():
                 continue
 
-            # don't exceed population caps
+            # population caps
             if (creature.species == Species.HERBIVORE
                     and herb_count >= cfg.MAX_POPULATION_HERBIVORE):
                 continue
@@ -226,22 +389,28 @@ class World:
                     and carn_count >= cfg.MAX_POPULATION_CARNIVORE):
                 continue
 
-            # maybe find a mate for crossover
+            # find best compatible mate nearby
             partner = None
-            if np.random.rand() < cfg.CROSSOVER_RATE:
-                for other in self._get_neighbors(creature):
-                    if (
-                        other is not creature
-                        and other.alive
-                        and other.species == creature.species
-                        and creature.distance_to(other) < cfg.SENSOR_RANGE * 0.5
-                    ):
-                        partner = other
-                        break
+            best_mate_dist = cfg.MATE_SEARCH_RANGE
 
-            child = creature.reproduce(partner)
+            for other in self._get_neighbors(creature):
+                if other.id in already_bred:
+                    continue
+                if not creature.is_compatible_mate(other):
+                    continue
+                dist = creature.distance_to(other)
+                if dist < best_mate_dist:
+                    best_mate_dist = dist
+                    partner = other
+
+            if partner is None:
+                continue
+
+            child = creature.reproduce_with(partner)
             new_creatures.append(child)
             self.total_births += 1
+            already_bred.add(creature.id)
+            already_bred.add(partner.id)
 
             if creature.species == Species.HERBIVORE:
                 herb_count += 1
@@ -253,9 +422,13 @@ class World:
     # --- cleanup ---
 
     def _remove_dead(self):
-        dead_count = sum(1 for c in self.creatures if not c.alive)
-        self.total_deaths += dead_count
-        self.creatures = [c for c in self.creatures if c.alive]
+        alive_creatures = []
+        for c in self.creatures:
+            if c.alive:
+                alive_creatures.append(c)
+            else:
+                self.total_deaths += 1
+        self.creatures = alive_creatures
         self.food_items = [f for f in self.food_items if f.alive]
 
     def _enforce_population_limits(self):
@@ -278,7 +451,7 @@ class World:
             self.creatures.append(c)
             herb_count += 1
 
-        while carn_count < cfg.MIN_POPULATION // 2:
+        while carn_count < max(2, cfg.MIN_POPULATION // 4):
             genome = self._get_seed_genome(Species.CARNIVORE)
             c = Creature(
                 x=np.random.uniform(20, cfg.WORLD_WIDTH - 20),

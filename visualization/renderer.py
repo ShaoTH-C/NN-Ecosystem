@@ -73,12 +73,18 @@ class Renderer:
 
     # --- main render loop ---
 
-    def render(self) -> bool:
-        """Draw one frame. Returns False if the window was closed."""
+    def process_events(self) -> bool:
+        """Handle input events without drawing. Returns False if window closed."""
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 return False
             self._handle_event(event)
+        return True
+
+    def render(self) -> bool:
+        """Draw one frame. Returns False if the window was closed."""
+        if not self.process_events():
+            return False
 
         self.screen.fill(cfg.BACKGROUND_COLOR)
         self._draw_grid()
@@ -192,7 +198,9 @@ class Renderer:
                 continue
 
             cx, cy = self._world_to_screen(creature.x, creature.y)
-            r = self._scale(cfg.CREATURE_RADIUS)
+            base_r = self._scale(cfg.CREATURE_RADIUS)
+            # children are visually smaller, growing to full size at maturity
+            r = max(3, int(base_r * (0.55 + 0.45 * creature.maturity)))
 
             if self.show_sensors or creature is self.selected_creature:
                 self._draw_sensors(creature)
@@ -386,7 +394,7 @@ class Renderer:
             return
 
         panel_w = 250
-        panel_h = 200
+        panel_h = 230
         panel_x = 10
         panel_y = self.win_h - panel_h - 10
 
@@ -407,8 +415,9 @@ class Renderer:
         y = panel_y + 32
         lines = [
             f"Energy:    {c.energy:.1f} / {cfg.MAX_ENERGY}",
-            f"Age:       {c.age} ticks",
-            f"Speed:     {c.speed:.2f}",
+            f"Age:       {c.age} / {c.lifespan}",
+            f"Maturity:  {c.maturity:.0%}",
+            f"Speed:     {c.speed:.2f} / {c.max_speed:.2f}",
             f"Gen:       {c.genome.generation}",
             f"Children:  {c.children_count}",
             f"Food:      {c.food_eaten}",

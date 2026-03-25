@@ -22,10 +22,11 @@ def crossover(parent_a: Genome, parent_b: Genome) -> Genome:
     """
     Uniform crossover - each gene randomly comes from parent A or B.
     If the parents have different topologies, just clone the fitter one.
+    Generation is set to max of parents (caller handles incrementing).
     """
     if parent_a.layer_sizes != parent_b.layer_sizes:
         better = parent_a if parent_a.fitness >= parent_b.fitness else parent_b
-        return better.mutate()
+        return better.copy()
 
     mask = np.random.rand(len(parent_a.genes)) < 0.5
     child_genes = np.where(mask, parent_a.genes, parent_b.genes)
@@ -33,7 +34,7 @@ def crossover(parent_a: Genome, parent_b: Genome) -> Genome:
     child = Genome(
         layer_sizes=list(parent_a.layer_sizes),
         genes=child_genes,
-        generation=max(parent_a.generation, parent_b.generation) + 1,
+        generation=max(parent_a.generation, parent_b.generation),
     )
     return child
 
@@ -45,7 +46,7 @@ def blend_crossover(parent_a: Genome, parent_b: Genome, alpha: float = 0.5) -> G
     """
     if parent_a.layer_sizes != parent_b.layer_sizes:
         better = parent_a if parent_a.fitness >= parent_b.fitness else parent_b
-        return better.mutate()
+        return better.copy()
 
     t = np.random.uniform(-alpha, 1.0 + alpha, size=len(parent_a.genes))
     child_genes = parent_a.genes * t + parent_b.genes * (1.0 - t)
@@ -53,7 +54,7 @@ def blend_crossover(parent_a: Genome, parent_b: Genome, alpha: float = 0.5) -> G
     child = Genome(
         layer_sizes=list(parent_a.layer_sizes),
         genes=child_genes,
-        generation=max(parent_a.generation, parent_b.generation) + 1,
+        generation=max(parent_a.generation, parent_b.generation),
     )
     return child
 
