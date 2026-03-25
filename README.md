@@ -1,4 +1,4 @@
-# euroEvolution Ecosystem Simulator
+# NeuroEvolution Ecosystem Simulator
 
 A program I wrote for fun ;)
 
