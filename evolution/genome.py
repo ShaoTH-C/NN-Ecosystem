@@ -30,14 +30,26 @@ class Genome:
             self.genes = self._xavier_init()
 
     def _xavier_init(self) -> np.ndarray:
-        """Xavier init - gives reasonable starting weights."""
+        """Xavier init with behavioral priors on the output layer.
+        Biases the output so creatures start with basic survival behavior:
+        move forward + eat, rather than spinning or standing still."""
         parts = []
-        for i in range(len(self.layer_sizes) - 1):
+        num_layers = len(self.layer_sizes) - 1
+        for i in range(num_layers):
             fan_in = self.layer_sizes[i]
             fan_out = self.layer_sizes[i + 1]
             std = np.sqrt(2.0 / (fan_in + fan_out))
             w = np.random.randn(fan_in * fan_out) * std
             b = np.zeros(fan_out)
+
+            # bias the output layer: [turn, speed, eat, attack, breed]
+            if i == num_layers - 1 and fan_out >= 5:
+                b[0] = np.random.uniform(-0.1, 0.1)  # slight random turn bias
+                b[1] = 0.5                            # bias toward moving forward
+                b[2] = 0.3                            # bias toward eating
+                b[3] = -0.2                           # don't attack by default
+                b[4] = 0.0                            # neutral on breeding
+
             parts.extend([w, b])
         return np.concatenate(parts)
 

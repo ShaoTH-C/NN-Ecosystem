@@ -83,6 +83,14 @@ class Creature:
         # circle detection — exponential moving average of signed turn values
         self.turn_accumulator = 0.0
 
+        # social awareness (set by World before thinking)
+        self.nearby_mates_count = 0
+        self.nearby_creature_count = 0
+
+        # performance tracking (rolling score for teaching system)
+        self.performance_score = 0.0
+        self._idle_ticks = 0
+
         # sensor data gets written every tick
         self.sensor_readings: np.ndarray = np.zeros(cfg.NUM_SENSOR_RAYS * 3)
         self.sensor_endpoints: List[Tuple[float, float]] = []
@@ -98,6 +106,75 @@ class Creature:
         self.wants_to_eat = False
         self.wants_to_attack = False
         self.wants_to_breed = False
+
+    # --- satiation / hunger ---
+
+    @property
+    def is_satiated(self) -> bool:
+        """True when energy is above the satiation threshold (creature is 'full')."""
+        return self.energy >= cfg.MAX_ENERGY * cfg.SATIATION_THRESHOLD
+
+    @property
+    def hunger_urgency(self) -> float:
+        """Nonlinear hunger signal: 1.0=starving, 0.0=full.
+        Uses a curve so urgency spikes sharply at low energy."""
+        energy_frac = self.energy / cfg.MAX_ENERGY
+        # quadratic curve: urgency rises fast as energy drops
+        return max(0.0, min(1.0, (1.0 - energy_frac) ** 1.5))
+
+    # --- performance tracking (for social learning / teaching) ---
+
+    def update_performance(self):
+        """Rolling performance score: measures how well this creature is doing
+        RIGHT NOW (not cumulative lifetime). Used by the teaching system to
+        identify who should teach whom.
+
+        Components:
+          - Energy health (35%): well-fed = doing something right
+          - Movement quality (25%): moving efficiently, not circling
+          - Survival experience (15%): older = more proven
+          - Reproductive success (15%): has bred successfully
+          - Feeding success (10%): has found food
+        """
+        score = 0.0
+
+        # energy health (0-1)
+        score += 0.35 * (self.energy / cfg.MAX_ENERGY)
+
+        # movement quality: reward moving, penalize circling
+        if self.max_speed > 0:
+            move_quality = min(self.speed / self.max_speed, 1.0)
+            circle_penalty = min(abs(self.turn_accumulator) / 3.0, 1.0)
+            score += 0.25 * move_quality * (1.0 - circle_penalty * 0.7)
+
+        # survival experience
+        score += 0.15 * min(self.age / 300.0, 1.0)
+
+        # reproductive success
+        score += 0.15 * min(self.children_count / 3.0, 1.0)
+
+        # feeding success
+        max_food = 10.0 if self.species == Species.HERBIVORE else 5.0
+        score += 0.10 * min(self.food_eaten / max_food, 1.0)
+
+        # exponential moving average for smoothness
+        self.performance_score = self.performance_score * 0.92 + score * 0.08
+
+    def learn_from(self, teacher: "Creature", blend_rate: float):
+        """Blend this creature's NN weights toward the teacher's.
+        Simulates social learning: watching a successful group member
+        and adjusting your own behavior to be more like theirs."""
+        my_weights = self.brain.get_flat_weights()
+        teacher_weights = teacher.brain.get_flat_weights()
+
+        if len(my_weights) != len(teacher_weights):
+            return  # incompatible architectures
+
+        # blend toward teacher (keep most of own personality)
+        new_weights = my_weights * (1.0 - blend_rate) + teacher_weights * blend_rate
+        self.brain.set_flat_weights(new_weights)
+        # sync genome so offspring inherit the learned behavior
+        self.genome.genes = new_weights.copy()
 
     # --- aging / maturity ---
 
@@ -305,13 +382,19 @@ class Creature:
         inputs[37] = self.parent_direction[0]
         inputs[38] = self.parent_direction[1]
 
-        # bias [39]
-        inputs[39] = 1.0
+        # hunger / satiation / breeding signals [39:43]
+        inputs[39] = self.hunger_urgency                   # 1=starving, 0=full
+        inputs[40] = 1.0 if self.is_satiated else 0.0     # step: full or not
+        inputs[41] = 1.0 if self._breeding_ready() else 0.0  # can breed right now?
+        inputs[42] = min(self.nearby_mates_count / 3.0, 1.0)  # normalized mate count
+
+        # bias [43]
+        inputs[43] = 1.0
 
         return inputs
 
     def apply_nn_outputs(self, outputs: np.ndarray):
-        """Interpret the NN output vector into actions."""
+        """Interpret the NN output vector into actions, then apply survival instincts."""
         # steer
         turn = float(outputs[0]) * self.turn_rate
         self.angle += turn
@@ -327,6 +410,39 @@ class Creature:
         self.wants_to_eat = float(outputs[2]) > 0.0
         self.wants_to_attack = float(outputs[3]) > 0.0
         self.wants_to_breed = float(outputs[4]) > 0.0
+
+        # --- survival instincts (override bad NN decisions) ---
+        self._apply_instincts()
+
+    def _apply_instincts(self):
+        """Innate survival reflexes that override bad NN behavior.
+        These keep creatures alive while their NN is still learning.
+        Like real animal instincts: even a newborn knows to move and eat."""
+
+        # instinct 1: break idle — if standing still too long, force movement
+        # (real animals get restless when hungry and stationary)
+        if self.speed < self.max_speed * cfg.MIN_WANDER_SPEED_FRAC:
+            self._idle_ticks += 1
+            if self._idle_ticks > cfg.IDLE_BREAK_TICKS:
+                # random direction change + forced movement
+                self.angle += np.random.uniform(-0.8, 0.8)
+                self.speed = self.max_speed * 0.4
+                self._idle_ticks = 0
+        else:
+            self._idle_ticks = max(0, self._idle_ticks - 1)
+
+        # instinct 2: break circles — sustained spinning wastes energy
+        # (like getting dizzy, the creature corrects course)
+        if abs(self.turn_accumulator) > cfg.CIRCLE_BREAK_THRESHOLD:
+            self.angle += np.random.uniform(-1.0, 1.0)
+            self.turn_accumulator *= 0.3  # dampen the accumulator
+            self.speed = max(self.speed, self.max_speed * 0.3)
+
+        # instinct 3: minimum wander speed — creatures always drift slightly
+        # (real animals are rarely perfectly still, even when "resting")
+        min_speed = self.max_speed * cfg.MIN_WANDER_SPEED_FRAC
+        if self.speed < min_speed:
+            self.speed = min_speed
 
     def think(self):
         """Convenience: build inputs, run NN, apply outputs (used as fallback)."""
@@ -385,24 +501,31 @@ class Creature:
 
     # --- reproduction ---
 
-    def can_breed(self) -> bool:
-        """Check if this creature is eligible to breed this tick."""
+    def _breeding_ready(self) -> bool:
+        """Check basic breeding eligibility (age + energy), ignoring NN decision."""
         if not self.alive:
             return False
         if self.energy < cfg.BREEDING_ENERGY_THRESHOLD:
             return False
-
-        # age range check
         min_age = int(self.lifespan * cfg.BREEDING_AGE_MIN_FRAC)
         max_age = int(self.lifespan * cfg.BREEDING_AGE_MAX_FRAC)
         if self.age < min_age or self.age > max_age:
             return False
+        return True
 
-        # NN decision OR instinct when energy is very high
+    def can_breed(self) -> bool:
+        """Check if this creature is eligible to breed this tick."""
+        if not self._breeding_ready():
+            return False
+
+        # satiated creatures instinctively breed (real-life: well-fed animals
+        # stop foraging and focus on reproduction)
+        if self.is_satiated:
+            return True
+
+        # NN decision
         if self.wants_to_breed:
             return True
-        if self.energy > cfg.MAX_ENERGY * 0.8:
-            return True  # instinct: breed when well-fed
 
         return False
 
@@ -478,12 +601,14 @@ class Creature:
             self.alive = False
             return
 
-        # fitness is a combo of survival, energy gathered, offspring, and kills
+        # fitness: reproductive success is king (like real evolution)
+        # children dominate because that's what natural selection actually selects for
         self.genome.fitness = (
-            self.age * 0.1
-            + self.total_energy_gained
-            + self.children_count * 30.0
-            + self.kills * 20.0
+            self.children_count * 150.0      # breeding IS fitness
+            + self.age * 0.08                # surviving helps but isn't the goal
+            + self.food_eaten * 1.5          # eating bootstraps early learning
+            + self.kills * 25.0              # carnivore hunting skill
+            + self.total_energy_gained * 0.3 # slight reward for energy efficiency
         )
         self.genome.age = self.age
 

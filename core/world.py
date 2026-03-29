@@ -92,6 +92,9 @@ class World:
 
         food_pos, herb_pos, carn_pos = self._gather_positions()
 
+        # phase 0.5: compute social awareness (nearby mates/density for NN inputs)
+        self._compute_social_info()
+
         # phase 1: sense (per-creature, vectorized rays + nearest-target)
         for creature in self.creatures:
             if not creature.alive:
@@ -119,6 +122,13 @@ class World:
         self._handle_eating()
         self._handle_attacks()
         self._handle_reproduction()
+
+        # phase 5: social learning
+        for creature in self.creatures:
+            if creature.alive:
+                creature.update_performance()
+        self._handle_teaching()
+
         self._remove_dead()
         self._enforce_population_limits()
         self._track_best_genomes()
@@ -215,6 +225,27 @@ class World:
             float(np.cos(rel_angle) * strength),
         )
 
+    # --- social awareness ---
+
+    def _compute_social_info(self):
+        """Set nearby_mates_count and nearby_creature_count for each creature.
+        This info feeds into the NN so creatures can learn mate-seeking behavior."""
+        for creature in self.creatures:
+            if not creature.alive:
+                continue
+            mates = 0
+            neighbors = 0
+            for other in self._get_neighbors(creature):
+                if other is creature or not other.alive:
+                    continue
+                neighbors += 1
+                if creature.is_compatible_mate(other):
+                    dist = creature.distance_to(other)
+                    if dist < cfg.MATE_SEARCH_RANGE:
+                        mates += 1
+            creature.nearby_mates_count = mates
+            creature.nearby_creature_count = neighbors
+
     # --- food spawning ---
 
     def _spawn_food(self):
@@ -291,6 +322,11 @@ class World:
             if not creature.alive or creature.species != Species.HERBIVORE:
                 continue
 
+            # satiated creatures don't eat — no benefit at full energy,
+            # and in real life well-fed animals stop foraging
+            if creature.is_satiated:
+                continue
+
             for food in self._get_nearby_food(creature):
                 if not food.alive:
                     continue
@@ -330,10 +366,13 @@ class World:
             if best_target is None:
                 continue
 
-            # instinct: auto-attack when very close, OR NN wants to attack
+            # satiated carnivores only attack in self-defense range (instinct),
+            # they don't actively hunt when full — they should be seeking mates
             do_attack = False
             if best_dist < cfg.INSTINCT_ATTACK_RANGE:
-                do_attack = True  # reflex
+                do_attack = True  # reflex — always attack if prey is right there
+            elif creature.is_satiated:
+                do_attack = False  # full: don't bother hunting, focus on breeding
             elif creature.wants_to_attack and best_dist < cfg.ATTACK_RANGE:
                 do_attack = True
 
@@ -390,8 +429,13 @@ class World:
                 continue
 
             # find best compatible mate nearby
+            # satiated creatures are more motivated to find mates (wider search)
+            search_range = cfg.MATE_SEARCH_RANGE
+            if creature.is_satiated:
+                search_range *= 1.3  # well-fed animals actively seek mates
+
             partner = None
-            best_mate_dist = cfg.MATE_SEARCH_RANGE
+            best_mate_dist = search_range
 
             for other in self._get_neighbors(creature):
                 if other.id in already_bred:
@@ -418,6 +462,49 @@ class World:
                 carn_count += 1
 
         self.creatures.extend(new_creatures)
+
+    # --- social learning / teaching ---
+
+    def _handle_teaching(self):
+        """Best-performing creatures teach nearby group members.
+        This simulates real-world social learning: animals in a group
+        observe successful members and adjust their behavior.
+
+        How it works:
+          - Every TEACHING_INTERVAL ticks, each creature looks for the
+            best performer of the same species within TEACHING_RADIUS
+          - If the teacher is significantly better (above TEACHING_MIN_PERF_GAP),
+            the learner blends its NN weights toward the teacher's
+          - Blend rate scales with the performance gap (bigger gap = learn more)
+        """
+        if self.tick % cfg.TEACHING_INTERVAL != 0:
+            return
+
+        for creature in self.creatures:
+            if not creature.alive:
+                continue
+
+            best_teacher = None
+            best_perf = creature.performance_score
+
+            for other in self._get_neighbors(creature):
+                if other is creature or not other.alive:
+                    continue
+                if other.species != creature.species:
+                    continue
+                dist = creature.distance_to(other)
+                if dist > cfg.TEACHING_RADIUS:
+                    continue
+                if other.performance_score > best_perf + cfg.TEACHING_MIN_PERF_GAP:
+                    best_perf = other.performance_score
+                    best_teacher = other
+
+            if best_teacher is not None:
+                # blend rate scales with how much better the teacher is
+                gap = best_teacher.performance_score - creature.performance_score
+                blend = min(cfg.TEACHING_BLEND_RATE * (gap / 0.3), cfg.TEACHING_MAX_BLEND)
+                blend = max(blend, 0.02)  # minimum learning rate
+                creature.learn_from(best_teacher, blend)
 
     # --- cleanup ---
 
