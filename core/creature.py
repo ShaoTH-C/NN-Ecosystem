@@ -2,6 +2,7 @@
 # each one has sensors, a neural network brain, an energy budget,
 # a lifespan with aging, and maturity growth from child to adult
 
+import math
 import numpy as np
 from typing import List, Tuple, Optional
 from enum import Enum
@@ -9,6 +10,13 @@ from enum import Enum
 from core.neural_network import NeuralNetwork
 from evolution.genome import Genome
 import config as cfg
+
+
+# cached config constants (avoid attribute lookups inside hot per-tick loops)
+_W = cfg.WORLD_WIDTH
+_H = cfg.WORLD_HEIGHT
+_W_HALF = _W * 0.5
+_H_HALF = _H * 0.5
 
 
 class Species(Enum):
@@ -90,6 +98,20 @@ class Creature:
         # performance tracking (rolling score for teaching system)
         self.performance_score = 0.0
         self._idle_ticks = 0
+        # forced-straight lockout — counts down each tick after a circle break.
+        # while > 0, the NN's turn output is zeroed so the creature drives
+        # straight long enough to actually leave the circle.
+        self._straight_lockout = 0
+
+        # displacement snapshot for slow-drift circle detection.
+        # turn_accumulator catches biased turning; this catches the sneakier
+        # pattern where the creature alternates turn signs but still traces
+        # a loop. If path-length grew a lot but net displacement didn't,
+        # they're looping regardless of how "balanced" their turns look.
+        self._snap_x = self.x
+        self._snap_y = self.y
+        self._snap_tick = 0
+        self._snap_path_len = 0.0
 
         # sensor data gets written every tick
         self.sensor_readings: np.ndarray = np.zeros(cfg.NUM_SENSOR_RAYS * 3)
@@ -395,8 +417,12 @@ class Creature:
 
     def apply_nn_outputs(self, outputs: np.ndarray):
         """Interpret the NN output vector into actions, then apply survival instincts."""
-        # steer
+        # steer — but during a forced-straight lockout, ignore the NN's turn
+        # signal entirely so the creature actually escapes its circle
         turn = float(outputs[0]) * self.turn_rate
+        if self._straight_lockout > 0:
+            turn = 0.0
+            self._straight_lockout -= 1
         self.angle += turn
         self.angle %= 2 * np.pi
 
@@ -431,12 +457,15 @@ class Creature:
         else:
             self._idle_ticks = max(0, self._idle_ticks - 1)
 
-        # instinct 2: break circles — sustained spinning wastes energy
-        # (like getting dizzy, the creature corrects course)
+        # instinct 2: break circles — sustained spinning wastes energy.
+        # Trigger a forced-straight lockout so the creature actually leaves the
+        # circle (a one-time angle nudge fails because the NN immediately
+        # resumes the same biased turn).
         if abs(self.turn_accumulator) > cfg.CIRCLE_BREAK_THRESHOLD:
-            self.angle += np.random.uniform(-1.0, 1.0)
-            self.turn_accumulator *= 0.3  # dampen the accumulator
-            self.speed = max(self.speed, self.max_speed * 0.3)
+            self._straight_lockout = cfg.CIRCLE_LOCKOUT_TICKS
+            self.angle += np.random.uniform(-0.6, 0.6)  # one nudge to vary direction
+            self.turn_accumulator = 0.0
+            self.speed = max(self.speed, self.max_speed * 0.5)
 
         # instinct 3: minimum wander speed — creatures always drift slightly
         # (real animals are rarely perfectly still, even when "resting")
@@ -601,6 +630,38 @@ class Creature:
             self.alive = False
             return
 
+        # slow-drift circle detection: every N ticks, compare current pos to
+        # the snapshot taken N ticks ago. If path walked >> net displacement,
+        # the creature is looping (even if turn_accumulator looks balanced).
+        if self.age - self._snap_tick >= cfg.CIRCLE_SNAPSHOT_INTERVAL:
+            path_walked = self.distance_traveled - self._snap_path_len
+            if (
+                self.age >= cfg.CIRCLE_HARD_BREAK_MIN_AGE
+                and path_walked >= cfg.CIRCLE_MIN_PATH_TO_CHECK
+            ):
+                # toroidal displacement from snapshot
+                dx = abs(self.x - self._snap_x)
+                dy = abs(self.y - self._snap_y)
+                if dx > _W_HALF:
+                    dx = _W - dx
+                if dy > _H_HALF:
+                    dy = _H - dy
+                net = math.sqrt(dx * dx + dy * dy)
+                if net < cfg.CIRCLE_MAX_NET_DISPLACEMENT:
+                    # hard break: big random angle jump + long straight lockout
+                    self.angle = (
+                        self.angle + np.random.uniform(math.pi / 2, math.pi)
+                        * np.random.choice([-1.0, 1.0])
+                    ) % (2 * np.pi)
+                    self._straight_lockout = cfg.CIRCLE_HARD_LOCKOUT_TICKS
+                    self.turn_accumulator = 0.0
+                    self.speed = max(self.speed, self.max_speed * 0.6)
+            # re-snapshot regardless (moves the window forward)
+            self._snap_x = self.x
+            self._snap_y = self.y
+            self._snap_tick = self.age
+            self._snap_path_len = self.distance_traveled
+
         # fitness: reproductive success is king (like real evolution)
         # children dominate because that's what natural selection actually selects for
         self.genome.fitness = (
@@ -619,12 +680,19 @@ class Creature:
         return np.array([self.x, self.y])
 
     def distance_to(self, other) -> float:
-        """Toroidal distance (wraps around edges)."""
+        """Toroidal distance (wraps around edges).
+
+        Uses stdlib math (not numpy) — np.sqrt has significant Python→C
+        dispatch overhead per scalar call, and this gets hit 4000+ times
+        per tick in social/eat/attack loops.
+        """
         dx = abs(self.x - other.x)
         dy = abs(self.y - other.y)
-        dx = min(dx, cfg.WORLD_WIDTH - dx)
-        dy = min(dy, cfg.WORLD_HEIGHT - dy)
-        return np.sqrt(dx * dx + dy * dy)
+        if dx > _W_HALF:
+            dx = _W - dx
+        if dy > _H_HALF:
+            dy = _H - dy
+        return math.sqrt(dx * dx + dy * dy)
 
     def __repr__(self):
         return (

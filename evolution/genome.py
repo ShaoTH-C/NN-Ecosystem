@@ -31,26 +31,37 @@ class Genome:
 
     def _xavier_init(self) -> np.ndarray:
         """Xavier init with behavioral priors on the output layer.
+
         Biases the output so creatures start with basic survival behavior:
-        move forward + eat, rather than spinning or standing still."""
+        move forward + eat, rather than spinning or standing still.
+
+        Anti-circling: the turn output's incoming weights are scaled down hard
+        (0.15×) and its bias is fixed at 0. With the ~52-input layer feeding
+        in, full-Xavier weights make the turn signal saturate near ±1 even
+        from random sensor noise — which produces persistent circling. Tiny
+        weights mean newborns drive nearly straight, then mutation / evolution
+        discovers turning when it's actually useful (chasing food, dodging).
+        """
         parts = []
         num_layers = len(self.layer_sizes) - 1
         for i in range(num_layers):
             fan_in = self.layer_sizes[i]
             fan_out = self.layer_sizes[i + 1]
             std = np.sqrt(2.0 / (fan_in + fan_out))
-            w = np.random.randn(fan_in * fan_out) * std
+            w = np.random.randn(fan_in, fan_out) * std
             b = np.zeros(fan_out)
 
             # bias the output layer: [turn, speed, eat, attack, breed]
             if i == num_layers - 1 and fan_out >= 5:
-                b[0] = np.random.uniform(-0.1, 0.1)  # slight random turn bias
-                b[1] = 0.5                            # bias toward moving forward
-                b[2] = 0.3                            # bias toward eating
-                b[3] = -0.2                           # don't attack by default
-                b[4] = 0.0                            # neutral on breeding
+                # zero turn bias + scaled-down turn weights → newborns go straight
+                w[:, 0] *= 0.15
+                b[0] = 0.0
+                b[1] = 0.5    # bias toward moving forward
+                b[2] = 0.3    # bias toward eating
+                b[3] = -0.2   # don't attack by default
+                b[4] = 0.0    # neutral on breeding
 
-            parts.extend([w, b])
+            parts.extend([w.reshape(-1), b])
         return np.concatenate(parts)
 
     def build_network(self) -> NeuralNetwork:

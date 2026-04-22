@@ -6,12 +6,13 @@ import numpy as np
 from typing import List, Callable
 
 # GPU support - try cupy for CUDA acceleration
+from core import _gpu_bootstrap  # registers pip-installed nvidia DLL dirs  # noqa: F401
 _GPU_AVAILABLE = False
 _cp = None
 try:
     import cupy as _cp
     _GPU_AVAILABLE = True
-except ImportError:
+except Exception:
     pass
 
 
