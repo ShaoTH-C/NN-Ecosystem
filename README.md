@@ -1,6 +1,6 @@
 # NeuroEvolution Ecosystem Simulator
 
-A program I wrote for fun ;) (Later Changed the game to feature player modes for DSGN 0020)
+A program I wrote for fun ;) (Later changed to a game to feature player modes for DSGN 0020, original NN now in debug mode)
 
 2D world where creatures with neural network brains evolve through natural selection. The NNs are built from scratch with NumPy (no pytorch/tensorflow). Herbivores eat plants, carnivores hunt herbivores, and over time they actually get better at it.
 
